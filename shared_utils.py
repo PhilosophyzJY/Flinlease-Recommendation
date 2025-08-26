@@ -7,23 +7,27 @@ from sklearn.preprocessing import normalize
 import re
 from itertools import combinations
 
-def load_and_engineer_features(filepath, n_term_bins=5):
-    """
-    Loads data, cleans it, and engineers binned features for value and term.
-    """
-    print("Loading and processing data...")
-    df = pd.read_csv(filepath, encoding='utf-8-sig')
+# --- Step 1: Data Loading and Cleaning ---
+def load_and_clean_data(filepath):
+    print("Step 1: Loading and cleaning data...")
+    try:
+        df_raw = pd.read_csv(filepath, encoding='utf-8-sig')
+        # Keep a copy for the "before" view
+        df_before = df_raw.head().to_dict(orient='records')
+        df = df_raw.copy()
+    except Exception as e:
+        raise ValueError(f"Error loading file: {e}")
+
     required_columns = ['承租人', '出租人', '承租人所属地区', '申万行业一级', '财产价值（万元）', '期限']
     df.dropna(subset=required_columns, inplace=True)
     df.columns = df.columns.str.strip()
+
     str_cols = ['承租人', '出租人', '承租人所属地区', '申万行业一级']
     for col in str_cols:
         df[col] = df[col].astype(str).str.strip()
 
     df['省份'] = df['承租人所属地区'].apply(lambda x: x.split('-')[0])
     df['财产价值（万元）'] = pd.to_numeric(df['财产价值（万元）'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-    df['价值分箱'] = pd.qcut(df['财产价值（万元）'], q=12, labels=False, duplicates='drop')
-    df['价值分箱'] = '价值' + df['价值分箱'].astype(str)
 
     def parse_term(term_str):
         term_str = str(term_str)
@@ -35,24 +39,39 @@ def load_and_engineer_features(filepath, n_term_bins=5):
     df['期限（年）'] = df['期限'].apply(parse_term)
     df.dropna(subset=['期限（年）'], inplace=True)
 
+    df_after = df[['承租人', '出租人', '省份', '申万行业一级', '财产价值（万元）', '期限（年）']].head().to_dict(orient='records')
+
+    return df, df_before, df_after
+
+# --- Step 2: Feature Engineering (Binning) ---
+def perform_binning(df, n_value_bins=12, n_term_bins=5):
+    print("Step 2: Performing feature binning...")
+    # Value Binning
+    df['价值分箱'] = pd.qcut(df['财产价值（万元）'], q=n_value_bins, labels=False, duplicates='drop')
+    df['价值分箱'] = '价值' + df['价值分箱'].astype(str)
+
+    # Term Binning
     kmeans = KMeans(n_clusters=n_term_bins, random_state=42, n_init=10)
     term_data = df[['期限（年）']].values
-    df['期限分箱'] = kmeans.fit_predict(term_data)
-    cluster_order = df.groupby('期限分箱')['期限（年）'].mean().sort_values().index
+    df['期限分箱_raw'] = kmeans.fit_predict(term_data)
+    cluster_order = df.groupby('期限分箱_raw')['期限（年）'].mean().sort_values().index
     label_mapping = {old_label: f'期限{i+1}' for i, old_label in enumerate(cluster_order)}
-    df['期限分箱'] = df['期限分箱'].map(label_mapping)
+    df['期限分箱'] = df['期限分箱_raw'].map(label_mapping)
+    df = df.drop(columns=['期限分箱_raw'])
 
-    print("Data loading and feature engineering complete.")
-    return df
+    value_bin_counts = df['价值分箱'].value_counts().to_dict()
+    term_bin_counts = df['期限分箱'].value_counts().to_dict()
 
-def build_heterogeneous_graph(df, n_province_clusters=5):
-    """
-    Builds the final heterogeneous graph, including inter-province edges.
-    """
-    print("Building heterogeneous graph...")
+    return df, {"value_bins": value_bin_counts, "term_bins": term_bin_counts}
+
+# --- Step 3: Graph Building and Recommendation ---
+def build_and_recommend(df, query, n_province_clusters=5, top_n=10):
+    print("Step 3: Building graph and running recommendation...")
+
+    # --- Graph Building ---
     G = nx.DiGraph()
 
-    # Province Similarity Calculation
+    # Province Similarity
     province_industry_matrix = pd.crosstab(df['省份'], df['申万行业一级'])
     province_profiles = normalize(province_industry_matrix, norm='l1', axis=1)
     kmeans = KMeans(n_clusters=n_province_clusters, random_state=42, n_init=10)
@@ -81,7 +100,7 @@ def build_heterogeneous_graph(df, n_province_clusters=5):
     for n_type, nodes in node_types.items():
         for node in nodes: G.add_node(node, node_type=n_type)
 
-    # Add Attribute -> Lessee Edges
+    # Add Edges
     edge_builders = [
         (prov_lessee_counts, '省份', '承租人', prov_totals),
         (ind_lessee_counts, '申万行业一级', '承租人', ind_totals),
@@ -93,11 +112,9 @@ def build_heterogeneous_graph(df, n_province_clusters=5):
             weight = row['count'] / totals_map.get(row[source_col], 1)
             G.add_edge(row[source_col], row[target_col], weight=weight)
 
-    # Add Lessee -> Lessor Edges
     for _, row in lessee_lessor_counts.iterrows():
         G.add_edge(row['承租人'], row['出租人'], weight=row['count'])
 
-    # Add Province -> Province Edges
     for i in range(n_province_clusters):
         cluster_provinces = province_industry_matrix[province_industry_matrix['cluster'] == i].index.tolist()
         for p1, p2 in combinations(cluster_provinces, 2):
@@ -107,14 +124,8 @@ def build_heterogeneous_graph(df, n_province_clusters=5):
                 G.add_edge(p2, p1, weight=similarity)
 
     print(f"Graph built with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges.")
-    return G
 
-def get_recommendations(G, query, top_n=10):
-    """
-    Runs Personalized PageRank on the heterogeneous graph.
-    """
-    print("\nRunning Personalized PageRank...")
-
+    # --- Personalized PageRank ---
     personalization = {
         query['province']: 0.25,
         query['industry']: 0.25,
@@ -127,30 +138,10 @@ def get_recommendations(G, query, top_n=10):
     lessor_scores = {n: s for n, s in pagerank_scores.items() if G.nodes[n].get('node_type') == 'lessor'}
     sorted_lessors = sorted(lessor_scores.items(), key=lambda item: item[1], reverse=True)
 
-    return sorted_lessors[:top_n]
+    # Format for response
+    response_data = [
+        {"rank": i + 1, "lessor": lessor, "score": round(score * 1000, 4)}
+        for i, (lessor, score) in enumerate(sorted_lessors[:top_n])
+    ]
 
-if __name__ == '__main__':
-    df = load_and_engineer_features('finlease_train.csv')
-    if df is not None:
-        G = build_heterogeneous_graph(df)
-
-        # --- Define Sample Query ---
-        prov = '山东'
-        ind = '农林牧渔'
-        sample_query_df = df[(df['省份'] == prov) & (df['申万行业一级'] == ind)]
-
-        if not sample_query_df.empty:
-            query = {
-                "province": prov,
-                "industry": ind,
-                "value_bin": sample_query_df['价值分箱'].mode()[0],
-                "term_bin": sample_query_df['期限分箱'].mode()[0],
-            }
-            print(f"\n--- Running Sample Recommendation for: {query} ---")
-            recommendations = get_recommendations(G, query)
-
-            print("\n--- Top 10 Recommended Lessors ---")
-            for i, (lessor, score) in enumerate(recommendations, 1):
-                print(f"{i}. {lessor} (Score: {score:.6f})")
-        else:
-            print(f"\nCould not find sample data for query: Province='{prov}', Industry='{ind}'")
+    return response_data

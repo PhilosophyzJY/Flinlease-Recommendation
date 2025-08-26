@@ -2,3 +2,4 @@ pandas
 networkx
 scipy
 Flask
+scikit-learn
