@@ -13,7 +13,7 @@ def load_and_engineer_features(filepath, n_term_bins=5):
     """
     print("Loading and processing data...")
     df = pd.read_csv(filepath, encoding='utf-8-sig')
-    required_columns = ['承租人', '出租人', '承租人所属地区', '申万行业一级', '财产价值（万元）', '期限']
+    required_columns = ['承租人', '出租人', '承租人所属地区', '申万行业一级', '财产价值（万元）', '期限', '披露日期']
     df.dropna(subset=required_columns, inplace=True)
     df.columns = df.columns.str.strip()
     str_cols = ['承租人', '出租人', '承租人所属地区', '申万行业一级']
@@ -41,6 +41,10 @@ def load_and_engineer_features(filepath, n_term_bins=5):
     cluster_order = df.groupby('期限分箱')['期限（年）'].mean().sort_values().index
     label_mapping = {old_label: f'期限{i+1}' for i, old_label in enumerate(cluster_order)}
     df['期限分箱'] = df['期限分箱'].map(label_mapping)
+
+    # 4. Date
+    df['披露日期'] = pd.to_datetime(df['披露日期'], errors='coerce')
+    df.dropna(subset=['披露日期'], inplace=True)
 
     print("Data loading and feature engineering complete.")
     return df
@@ -93,9 +97,22 @@ def build_heterogeneous_graph(df, n_province_clusters=5):
             weight = row['count'] / totals_map.get(row[source_col], 1)
             G.add_edge(row[source_col], row[target_col], weight=weight)
 
-    # Add Lessee -> Lessor Edges
-    for _, row in lessee_lessor_counts.iterrows():
-        G.add_edge(row['承租人'], row['出租人'], weight=row['count'])
+    # Add Lessee -> Lessor Edges with Time-Decayed Value
+    # Calculate time decay score for each transaction
+    t_max = df['披露日期'].max()
+    # Lambda is the decay constant; a smaller value means slower decay.
+    # A decay of 0.005 means a transaction from ~2 years ago has ~1/e^3.65 = ~2.5% of its original value.
+    lambda_decay = 0.005
+    df['time_decay_score'] = np.exp(-lambda_decay * (t_max - df['披露日期']).dt.days)
+    df['weighted_value'] = df['财产价值（万元）'] * df['time_decay_score']
+
+    # Aggregate this new score for the edge weight
+    lessee_lessor_weights = df.groupby(['承租人', '出租人'])['weighted_value'].sum().reset_index()
+
+    for _, row in lessee_lessor_weights.iterrows():
+        # Ensure weight is not zero to avoid issues, though it's unlikely
+        if row['weighted_value'] > 0:
+            G.add_edge(row['承租人'], row['出租人'], weight=row['weighted_value'])
 
     # Add Province -> Province Edges
     for i in range(n_province_clusters):
