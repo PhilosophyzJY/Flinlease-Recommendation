@@ -11,15 +11,21 @@ def load_and_engineer_features(filepath, n_term_bins=5):
     """
     Loads data, cleans it, and engineers binned features for value and term.
     """
-    print("Loading and processing data...")
-    df = pd.read_csv(filepath, encoding='utf-8-sig')
+    print("  - Loading and cleaning data...")
+    try:
+        df = pd.read_csv(filepath, encoding='utf-8-sig')
+    except Exception as e:
+        raise ValueError(f"Error loading file: {e}")
+
     required_columns = ['承租人', '出租人', '承租人所属地区', '申万行业一级', '财产价值（万元）', '期限', '披露日期']
     df.dropna(subset=required_columns, inplace=True)
     df.columns = df.columns.str.strip()
+
     str_cols = ['承租人', '出租人', '承租人所属地区', '申万行业一级']
     for col in str_cols:
         df[col] = df[col].astype(str).str.strip()
 
+    print("  - Engineering features...")
     df['省份'] = df['承租人所属地区'].apply(lambda x: x.split('-')[0])
     df['财产价值（万元）'] = pd.to_numeric(df['财产价值（万元）'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
     df['价值分箱'] = pd.qcut(df['财产价值（万元）'], q=12, labels=False, duplicates='drop')
@@ -42,21 +48,19 @@ def load_and_engineer_features(filepath, n_term_bins=5):
     label_mapping = {old_label: f'期限{i+1}' for i, old_label in enumerate(cluster_order)}
     df['期限分箱'] = df['期限分箱'].map(label_mapping)
 
-    # 4. Date
     df['披露日期'] = pd.to_datetime(df['披露日期'], errors='coerce')
     df.dropna(subset=['披露日期'], inplace=True)
 
-    print("Data loading and feature engineering complete.")
     return df
 
-def build_heterogeneous_graph(df, n_province_clusters=5):
+def build_heterogeneous_graph(df, n_province_clusters=5, lessee_lessor_weights=None):
     """
-    Builds the final heterogeneous graph, including inter-province edges.
+    Builds the final heterogeneous graph.
+    Accepts pre-computed lessee-lessor weights for optimization efficiency.
     """
-    print("Building heterogeneous graph...")
     G = nx.DiGraph()
 
-    # Province Similarity Calculation
+    # Province Similarity
     province_industry_matrix = pd.crosstab(df['省份'], df['申万行业一级'])
     province_profiles = normalize(province_industry_matrix, norm='l1', axis=1)
     kmeans = KMeans(n_clusters=n_province_clusters, random_state=42, n_init=10)
@@ -65,7 +69,7 @@ def build_heterogeneous_graph(df, n_province_clusters=5):
     similarity_matrix = cosine_similarity(province_profiles)
     similarity_df = pd.DataFrame(similarity_matrix, index=province_industry_matrix.index, columns=province_industry_matrix.index)
 
-    # Node and Edge Weight Pre-calculation
+    # Pre-calculation for Attribute -> Lessee edges
     prov_totals = df.groupby('省份').size()
     ind_totals = df.groupby('申万行业一级').size()
     val_totals = df.groupby('价值分箱').size()
@@ -74,7 +78,6 @@ def build_heterogeneous_graph(df, n_province_clusters=5):
     ind_lessee_counts = df.groupby(['申万行业一级', '承租人']).size().reset_index(name='count')
     val_lessee_counts = df.groupby(['价值分箱', '承租人']).size().reset_index(name='count')
     term_lessee_counts = df.groupby(['期限分箱', '承租人']).size().reset_index(name='count')
-    lessee_lessor_counts = df.groupby(['承租人', '出租人']).size().reset_index(name='count')
 
     # Add Nodes
     node_types = {
@@ -97,41 +100,35 @@ def build_heterogeneous_graph(df, n_province_clusters=5):
             weight = row['count'] / totals_map.get(row[source_col], 1)
             G.add_edge(row[source_col], row[target_col], weight=weight)
 
-    # Add Lessee -> Lessor Edges with Time-Decayed Value
-    # Calculate time decay score for each transaction
-    t_max = df['披露日期'].max()
-    # Lambda is the decay constant; a smaller value means slower decay.
-    # A decay of 0.005 means a transaction from ~2 years ago has ~1/e^3.65 = ~2.5% of its original value.
-    lambda_decay = 0.005
-    df['time_decay_score'] = np.exp(-lambda_decay * (t_max - df['披露日期']).dt.days)
-    df['weighted_value'] = df['财产价值（万元）'] * df['time_decay_score']
-
-    # Aggregate this new score for the edge weight
-    lessee_lessor_weights = df.groupby(['承租人', '出租人'])['weighted_value'].sum().reset_index()
+    # Add Lessee -> Lessor Edges
+    if lessee_lessor_weights is None: # Default behavior for recommender.py
+        t_max = df['披露日期'].max()
+        lambda_decay = 0.005
+        df['time_decayed_value'] = df['财产价值（万元）'] * np.exp(-lambda_decay * (t_max - df['披露日期']).dt.days)
+        global_total_weighted_value = df['time_decayed_value'].sum()
+        lessee_lessor_weights = df.groupby(['承租人', '出租人'])['time_decayed_value'].sum().reset_index()
+        lessee_lessor_weights['weight'] = lessee_lessor_weights['time_decayed_value'] / global_total_weighted_value
 
     for _, row in lessee_lessor_weights.iterrows():
-        # Ensure weight is not zero to avoid issues, though it's unlikely
-        if row['weighted_value'] > 0:
-            G.add_edge(row['承租人'], row['出租人'], weight=row['weighted_value'])
+        if row['weight'] > 0:
+            G.add_edge(row['承租人'], row['出租人'], weight=row['weight'])
 
     # Add Province -> Province Edges
+    similarity_df_normalized = similarity_df.div(similarity_df.sum(axis=1), axis=0)
     for i in range(n_province_clusters):
         cluster_provinces = province_industry_matrix[province_industry_matrix['cluster'] == i].index.tolist()
         for p1, p2 in combinations(cluster_provinces, 2):
-            similarity = similarity_df.loc[p1, p2]
-            if similarity > 0:
-                G.add_edge(p1, p2, weight=similarity)
-                G.add_edge(p2, p1, weight=similarity)
+            similarity_p1_p2 = similarity_df_normalized.loc[p1, p2]
+            if similarity_p1_p2 > 0: G.add_edge(p1, p2, weight=similarity_p1_p2)
+            similarity_p2_p1 = similarity_df_normalized.loc[p2, p1]
+            if similarity_p2_p1 > 0: G.add_edge(p2, p1, weight=similarity_p2_p1)
 
-    print(f"Graph built with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges.")
     return G
 
 def get_recommendations(G, query, top_n=10):
     """
-    Runs Personalized PageRank on the heterogeneous graph.
+    Runs Personalized PageRank and scales the scores.
     """
-    print("\nRunning Personalized PageRank...")
-
     personalization = {
         query['province']: 0.25,
         query['industry']: 0.25,
@@ -142,32 +139,16 @@ def get_recommendations(G, query, top_n=10):
     pagerank_scores = nx.pagerank(G, alpha=0.85, personalization=personalization, weight='weight')
 
     lessor_scores = {n: s for n, s in pagerank_scores.items() if G.nodes[n].get('node_type') == 'lessor'}
-    sorted_lessors = sorted(lessor_scores.items(), key=lambda item: item[1], reverse=True)
+    if not lessor_scores: return []
 
-    return sorted_lessors[:top_n]
-
-if __name__ == '__main__':
-    df = load_and_engineer_features('finlease_train.csv')
-    if df is not None:
-        G = build_heterogeneous_graph(df)
-
-        # --- Define Sample Query ---
-        prov = '山东'
-        ind = '农林牧渔'
-        sample_query_df = df[(df['省份'] == prov) & (df['申万行业一级'] == ind)]
-
-        if not sample_query_df.empty:
-            query = {
-                "province": prov,
-                "industry": ind,
-                "value_bin": sample_query_df['价值分箱'].mode()[0],
-                "term_bin": sample_query_df['期限分箱'].mode()[0],
-            }
-            print(f"\n--- Running Sample Recommendation for: {query} ---")
-            recommendations = get_recommendations(G, query)
-
-            print("\n--- Top 10 Recommended Lessors ---")
-            for i, (lessor, score) in enumerate(recommendations, 1):
-                print(f"{i}. {lessor} (Score: {score:.6f})")
+    min_score, max_score = min(lessor_scores.values()), max(lessor_scores.values())
+    scaled_scores = {}
+    for lessor, score in lessor_scores.items():
+        if max_score == min_score: scaled_score = 300
         else:
-            print(f"\nCould not find sample data for query: Province='{prov}', Industry='{ind}'")
+            normalized = (score - min_score) / (max_score - min_score)
+            scaled_score = 300 + normalized * (850 - 300)
+        scaled_scores[lessor] = int(round(scaled_score))
+
+    sorted_lessors = sorted(scaled_scores.items(), key=lambda item: item[1], reverse=True)
+    return sorted_lessors[:top_n]

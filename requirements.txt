@@ -3,3 +3,4 @@ networkx
 scipy
 Flask
 scikit-learn
+matplotlib
