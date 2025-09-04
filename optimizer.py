@@ -3,7 +3,65 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import pickle
+import plotly.graph_objects as go
 from utils import load_data, fit_binners, transform_data, build_heterogeneous_graph, get_recommendations
+
+def generate_sankey_diagrams(df, output_html_path, top_n=10):
+    """
+    Generates a Sankey diagram HTML report showing top lessor preferences.
+    """
+    print(f"\n--- Generating Sankey Diagram Report for Top {top_n} Lessors ---")
+
+    # Find top N lessors by total transaction value
+    top_lessors = df.groupby('出租人')['财产价值（万元）'].sum().nlargest(top_n).index
+    df_top = df[df['出租人'].isin(top_lessors)]
+
+    figs = {}
+    preference_dims = {
+        '地域偏好 (Province)': '省份',
+        '行业偏好 (Industry)': '申万行业一级',
+        '财产价值偏好 (Value Bin)': '价值分箱',
+        '期限偏好 (Term Bin)': '期限分箱'
+    }
+
+    for title, dim_col in preference_dims.items():
+        # Aggregate data
+        sankey_data = df_top.groupby(['出租人', dim_col])['财产价值（万元）'].sum().reset_index()
+        sankey_data.columns = ['source', 'target', 'value']
+
+        # Create nodes and links for Plotly
+        all_nodes = pd.concat([sankey_data['source'], sankey_data['target']]).unique()
+        node_map = {name: i for i, name in enumerate(all_nodes)}
+
+        links = {
+            'source': sankey_data['source'].map(node_map),
+            'target': sankey_data['target'].map(node_map),
+            'value': sankey_data['value']
+        }
+
+        # Create figure
+        fig = go.Figure(data=[go.Sankey(
+            node=dict(
+                pad=15,
+                thickness=20,
+                line=dict(color="black", width=0.5),
+                label=all_nodes,
+            ),
+            link=links
+        )])
+        fig.update_layout(title_text=f"Top {top_n} 出租人 - {title}", font_size=10)
+        figs[title] = fig
+
+    # Write all figures to a single HTML file
+    with open(output_html_path, 'w', encoding='utf-8') as f:
+        f.write("<h1>出租人偏好桑基图分析报告 (Lessor Preference Sankey Diagram Report)</h1>")
+        for title, fig in figs.items():
+            f.write(f"<h2>{title}</h2>")
+            f.write(fig.to_html(full_html=False, include_plotlyjs='cdn'))
+            f.write("<hr>")
+
+    print(f"Sankey diagram report saved to '{output_html_path}'")
+
 
 def calculate_lessee_lessor_weights(df, w_freq, w_val, lambda_decay):
     """Calculates the composite Lessee -> Lessor edge weights for the optimizer."""
@@ -61,6 +119,7 @@ def run_optimizer():
     plot_file = config['Paths']['plot_file']
     binning_rules_file = config['Paths']['binning_rules_file']
     report_file = config['Paths']['report_file']
+    sankey_report_file = config['Paths']['sankey_report_file']
     n_term_bins = config.getint('Data_Settings', 'n_term_bins')
     n_value_bins = config.getint('Data_Settings', 'n_value_bins')
     n_province_clusters = config.getint('Data_Settings', 'n_province_clusters')
@@ -101,7 +160,10 @@ def run_optimizer():
     train_df = transform_data(train_df_raw, binning_artifacts)
     test_df = transform_data(test_df_raw, binning_artifacts)
 
-    # 4. Identify Target Lessees and Create Test Lookup
+    # 4. Generate Sankey Diagrams from training data
+    generate_sankey_diagrams(train_df, sankey_report_file)
+
+    # 5. Identify Target Lessees and Create Test Lookup
     train_lessees = set(train_df['承租人'].unique())
     test_lessees = set(test_df['承租人'].unique())
     target_lessees = list(train_lessees.intersection(test_lessees))
