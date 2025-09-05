@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import pickle
 import plotly.graph_objects as go
 from utils import load_data, fit_binners, transform_data, build_heterogeneous_graph, get_recommendations
+from bi_report_generator import generate_bi_report
 
 def generate_sankey_diagrams(df, output_html_path, top_n=10):
     """
@@ -120,6 +121,7 @@ def run_optimizer():
     binning_rules_file = config['Paths']['binning_rules_file']
     report_file = config['Paths']['report_file']
     sankey_report_file = config['Paths']['sankey_report_file']
+    bi_report_file = config['Paths']['bi_report_file']
     n_term_bins = config.getint('Data_Settings', 'n_term_bins')
     n_value_bins = config.getint('Data_Settings', 'n_value_bins')
     n_province_clusters = config.getint('Data_Settings', 'n_province_clusters')
@@ -159,6 +161,9 @@ def run_optimizer():
     # 3. Transform both datasets using the SAME rules
     train_df = transform_data(train_df_raw, binning_artifacts)
     test_df = transform_data(test_df_raw, binning_artifacts)
+
+    # 4. Generate Comprehensive BI Report
+    generate_bi_report(train_df, bi_report_file)
 
     # 4. Generate Sankey Diagrams from training data
     generate_sankey_diagrams(train_df, sankey_report_file)
