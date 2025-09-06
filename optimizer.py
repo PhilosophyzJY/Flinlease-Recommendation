@@ -4,8 +4,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 import plotly.graph_objects as go
-from utils import load_data, fit_binners, transform_data, build_heterogeneous_graph, get_recommendations
+from utils import load_data, fit_binners, transform_data, calculate_advanced_scores, build_heterogeneous_graph, get_recommendations
 from bi_report_generator import generate_bi_report
+from sklearn.preprocessing import normalize
 
 def generate_sankey_diagrams(df, output_html_path, top_n=10):
     """
@@ -64,21 +65,6 @@ def generate_sankey_diagrams(df, output_html_path, top_n=10):
     print(f"Sankey diagram report saved to '{output_html_path}'")
 
 
-def calculate_lessee_lessor_weights(df, w_freq, w_val, lambda_decay):
-    """Calculates the composite Lessee -> Lessor edge weights for the optimizer."""
-    df = df.copy()
-    lessee_total_counts = df.groupby('承租人')['承租人'].transform('size')
-    pair_counts = df.groupby(['承租人', '出租人'])['承租人'].transform('size')
-    df['freq_prop'] = pair_counts / lessee_total_counts
-    lessee_total_value = df.groupby('承租人')['财产价值（万元）'].transform('sum')
-    pair_values = df.groupby(['承租人', '出租人'])['财产价值（万元）'].transform('sum')
-    df['val_prop'] = (pair_values / lessee_total_value).fillna(0)
-    t_max = df['披露日期'].max()
-    time_decay = np.exp(-lambda_decay * (t_max - df['披露日期']).dt.days)
-    df['composite_score'] = (df['freq_prop'] * w_freq + df['val_prop'] * w_val) * time_decay
-    lessee_lessor_weights = df.groupby(['承租人', '出租人'])['composite_score'].sum().reset_index(name='weight')
-    return lessee_lessor_weights
-
 def generate_binning_report(artifacts, province_clusters, report_file):
     """Generates a human-readable report of the binning results."""
     with open(report_file, 'w', encoding='utf-8') as f:
@@ -108,14 +94,34 @@ def generate_binning_report(artifacts, province_clusters, report_file):
     print(f"Binning report saved to '{report_file}'.")
 
 
+def get_weight_combinations(step=0.1):
+    """
+    Generates combinations of 4 weights that sum to 1.0.
+    """
+    weights = []
+    step = round(step, 4)
+    for i in np.arange(0, 1.0 + step, step):
+        for j in np.arange(0, 1.0 - i + step, step):
+            for k in np.arange(0, 1.0 - i - j + step, step):
+                l = 1.0 - i - j - k
+                if l >= -1e-9 and l <= 1.0 + 1e-9:
+                    weights.append({
+                        'province': round(i, 4),
+                        'industry': round(j, 4),
+                        'value': round(k, 4),
+                        'term': round(l, 4)
+                    })
+    return weights
+
+
 def run_optimizer():
     """
-    Runs the full hyperparameter tuning pipeline.
+    Runs the full hyperparameter tuning pipeline for the advanced model.
     """
     config = configparser.ConfigParser()
     config.read('config.ini')
 
-    # Load settings from config
+    # Load settings
     learning_data_file = config['Paths']['learning_data_file']
     plot_file = config['Paths']['plot_file']
     binning_rules_file = config['Paths']['binning_rules_file']
@@ -130,78 +136,71 @@ def run_optimizer():
     train_periods = [pd.to_datetime(p.strip()).to_period('M') for p in train_months_str.split(',')]
     test_periods = [pd.to_datetime(p.strip()).to_period('M') for p in test_months_str.split(',')]
     lambda_start, lambda_end, lambda_steps = map(float, config['Optimization_Settings']['lambda_space'].split(','))
-    weight_start, weight_end, weight_steps = map(float, config['Optimization_Settings']['weight_space'].split(','))
+    weight_step = config.getfloat('Optimization_Settings', 'attribute_weight_step')
 
-    # 1. Load and Split Data
+    # 1. Load and prepare data
     print("--- Preparing Data for Optimization ---")
     df = load_data(learning_data_file)
     df['year_month'] = df['披露日期'].dt.to_period('M')
     train_df_raw = df[df['year_month'].isin(train_periods)]
     test_df_raw = df[df['year_month'].isin(test_periods)]
 
-    # 2. Fit Binners, Save Artifacts, and Generate Report
     binning_artifacts = fit_binners(train_df_raw, n_value_bins, n_term_bins, n_province_clusters)
-    with open(binning_rules_file, 'wb') as f:
-        pickle.dump(binning_artifacts, f)
-    print(f"Binning rules saved to '{binning_rules_file}'.")
+    with open(binning_rules_file, 'wb') as f: pickle.dump(binning_artifacts, f)
 
-    # Generate human-readable report
+    # Generate human-readable report for binning
     province_pivot = binning_artifacts['province_pivot']
     province_binner = binning_artifacts['province_binner']
-    province_labels = province_binner.predict(province_pivot)
+    province_profiles = normalize(province_pivot, norm='l1', axis=1)
+    province_labels = province_binner.predict(province_profiles)
     province_clusters = {}
     for i, prov in enumerate(province_pivot.index):
         cluster_label = province_labels[i]
-        if cluster_label not in province_clusters:
-            province_clusters[cluster_label] = []
+        if cluster_label not in province_clusters: province_clusters[cluster_label] = []
         province_clusters[cluster_label].append(prov)
-
     generate_binning_report(binning_artifacts, province_clusters, report_file)
 
-    # 3. Transform both datasets using the SAME rules
     train_df = transform_data(train_df_raw, binning_artifacts)
     test_df = transform_data(test_df_raw, binning_artifacts)
 
-    # 4. Generate Comprehensive BI Report
+    # Generate BI and Sankey reports from transformed training data
     generate_bi_report(train_df, bi_report_file)
-
-    # 4. Generate Sankey Diagrams from training data
     generate_sankey_diagrams(train_df, sankey_report_file)
 
-    # 5. Identify Target Lessees and Create Test Lookup
-    train_lessees = set(train_df['承租人'].unique())
-    test_lessees = set(test_df['承租人'].unique())
-    target_lessees = list(train_lessees.intersection(test_lessees))
-    print(f"Found {len(target_lessees)} target lessees for validation.")
+    target_lessees = list(set(train_df['承租人'].unique()).intersection(set(test_df['承租人'].unique())))
     test_lookup = test_df.groupby('承租人')['出租人'].apply(set).to_dict()
+    print(f"Found {len(target_lessees)} target lessees for validation.")
 
-    # 5. Grid Search
+    # 2. Grid Search
     print("\n--- Starting Hyperparameter Grid Search ---")
     results = []
     best_params = {'hit_rate': -1}
     lambda_range = np.linspace(lambda_start, lambda_end, int(lambda_steps))
-    weight_range = np.linspace(weight_start, weight_end, int(weight_steps))
+    weight_combinations = get_weight_combinations(weight_step)
+    print(f"Testing {len(lambda_range)} lambda values and {len(weight_combinations)} weight combinations...")
+
+    lessee_attributes = train_df.drop_duplicates(subset=['承租人']).set_index('承租人')
 
     for l_decay in lambda_range:
-        for w_freq in weight_range:
-            w_val = 1.0 - w_freq
-            print(f"\nTesting params: lambda={l_decay:.4f}, w_freq={w_freq:.2f}, w_val={w_val:.2f}")
+        for weights in weight_combinations:
+            print(f"\nTesting params: lambda={l_decay:.4f}, weights={weights}")
 
-            lessee_lessor_weights = calculate_lessee_lessor_weights(train_df, w_freq, w_val, l_decay)
+            # Calculate advanced scores
+            train_df_scored = calculate_advanced_scores(train_df, l_decay, weights)
+
+            # Build graph
             G_train = build_heterogeneous_graph(
-                train_df,
-                lessee_lessor_weights=lessee_lessor_weights,
+                train_df_scored,
                 province_binner=binning_artifacts['province_binner'],
                 province_pivot=binning_artifacts['province_pivot']
             )
 
             hits = 0
-            lessee_attributes = train_df.drop_duplicates(subset=['承租人']).set_index('承租人')
             for lessee in target_lessees:
                 try:
                     lessee_data = lessee_attributes.loc[lessee]
                     query = {"province": lessee_data['省份'], "industry": lessee_data['申万行业一级'], "value_bin": lessee_data['价值分箱'], "term_bin": lessee_data['期限分箱']}
-                    recommendations = get_recommendations(G_train, query, top_n=5)
+                    recommendations = get_recommendations(G_train, query, weights, top_n=5)
                     recommended_lessors = {rec[0] for rec in recommendations}
                     actual_lessors = test_lookup.get(lessee, set())
                     if not actual_lessors.isdisjoint(recommended_lessors):
@@ -210,57 +209,83 @@ def run_optimizer():
 
             hit_rate = hits / len(target_lessees) if target_lessees else 0
             print(f"  => Hit Rate: {hit_rate:.4f}")
-            results.append({'lambda': l_decay, 'w_freq': w_freq, 'hit_rate': hit_rate})
+            current_result = {'lambda': l_decay, 'hit_rate': hit_rate, **weights}
+            results.append(current_result)
 
             if hit_rate > best_params['hit_rate']:
-                best_params = {'hit_rate': hit_rate, 'lambda': l_decay, 'w_freq': w_freq, 'w_val': w_val}
+                best_params = current_result
 
     print("\n--- Grid Search Complete ---")
     print(f"Best Hit Rate: {best_params['hit_rate']:.4f}")
-    print(f"Best Parameters: {best_params}")
+    best_weights = {k: v for k, v in best_params.items() if k in ['province', 'industry', 'value', 'term']}
+    print(f"Best Lambda: {best_params.get('lambda', 'N/A'):.4f}")
+    print(f"Best Weights: {best_weights}")
 
-    # 6. Plot Results
+    # 3. Plot Results
     print(f"\n--- Generating Plot: {plot_file} ---")
     df_results = pd.DataFrame(results)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for w_freq_val in df_results['w_freq'].unique():
-        subset = df_results[df_results['w_freq'] == w_freq_val]
-        ax.plot(subset['lambda'], subset['hit_rate'], marker='o', linestyle='-', label=f'w_freq={w_freq_val:.1f}')
-    ax.set_xlabel("Lambda (Time Decay Rate)"), ax.set_ylabel("Hit Rate"), ax.set_title("Hyperparameter Tuning Results")
-    ax.legend(), ax.grid(True)
-    plt.savefig(plot_file)
-    print("Plot saved.")
+    if not df_results.empty and best_params['hit_rate'] > -1:
+        # Find the top 5 best performing weight combinations
+        idx = df_results.groupby(['province', 'industry', 'value', 'term'])['hit_rate'].idxmax()
+        top_combinations = df_results.loc[idx].nlargest(5, 'hit_rate')
 
-    # 7. Write Learned Rules to Config for user review
+        fig, ax = plt.subplots(figsize=(12, 8))
+
+        for _, combo in top_combinations.iterrows():
+            weights = {
+                'province': combo['province'],
+                'industry': combo['industry'],
+                'value': combo['value'],
+                'term': combo['term']
+            }
+
+            # Filter the main results dataframe for this specific weight combination
+            subset = df_results[
+                (df_results['province'] == weights['province']) &
+                (df_results['industry'] == weights['industry']) &
+                (df_results['value'] == weights['value']) &
+                (df_results['term'] == weights['term'])
+            ]
+
+            label = (f"P={weights['province']:.2f}, I={weights['industry']:.2f}, "
+                     f"V={weights['value']:.2f}, T={weights['term']:.2f} "
+                     f"(Max Hit: {combo['hit_rate']:.2f})")
+            ax.plot(subset['lambda'], subset['hit_rate'], marker='o', linestyle='-', label=label)
+
+        ax.set_xlabel("Lambda (Time Decay Rate)")
+        ax.set_ylabel("Hit Rate")
+        ax.set_title("Hit Rate vs. Lambda for Top 5 Attribute Weight Combinations")
+        ax.legend(title="Weights (P,I,V,T) & Max Hit Rate", bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(True)
+        plt.tight_layout()
+        plt.savefig(plot_file)
+        print("Plot saved.")
+    else:
+        print("No results to plot.")
+
+    # 4. Write learned rules to config
     print("\n--- Writing Learned Rules to Config File ---")
     if not config.has_section('Learned_Rules_Summary'):
         config.add_section('Learned_Rules_Summary')
-
-    # Value bin boundaries
     value_bounds = binning_artifacts['value_bins']
     config.set('Learned_Rules_Summary', 'value_bin_boundaries', ', '.join([f'{b:.2f}' for b in value_bounds]))
-
-    # Term bin centers
     term_model = binning_artifacts['term_binner_model']
     term_centers = term_model.cluster_centers_.flatten()
     term_centers.sort()
     config.set('Learned_Rules_Summary', 'term_bin_centers_years', ', '.join([f'{c:.2f}' for c in term_centers]))
-
-    # Province cluster map
     import json
     sorted_clusters = {str(k): sorted(v) for k, v in province_clusters.items()}
     config.set('Learned_Rules_Summary', 'province_cluster_map_json', json.dumps(sorted_clusters, ensure_ascii=False))
-
     with open('config.ini', 'w') as configfile:
         config.write(configfile)
     print("Config file updated with learned rules summary.")
 
     print("\n--- ACTION REQUIRED ---")
-    print("Optimization complete. The optimizer has suggested the following parameters based on the best hit rate:")
+    print("Optimization complete. The optimizer has suggested the following parameters:")
     print(f"  - Best Hit Rate: {best_params['hit_rate']:.4f}")
-    print(f"  - Suggested Parameters: lambda={best_params['lambda']:.4f}, w_freq={best_params['w_freq']:.2f}, w_val={best_params['w_val']:.2f}")
-    print("\nPlease review the plot ('optimizer_plot.png'), the binning report ('binning_report.txt'), and the summary in 'config.ini'.")
-    print("--> Manually update the [Optimized_Parameters] section in 'config.ini' with your chosen values before running the recommender.")
+    print(f"  - Suggested Lambda: {best_params.get('lambda', 'N/A'):.4f}")
+    print(f"  - Suggested Weights: {best_weights}")
+    print("\nPlease review the plot and manually update the [Optimized_Parameters] section in 'config.ini'.")
 
 if __name__ == '__main__':
     run_optimizer()

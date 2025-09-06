@@ -92,31 +92,64 @@ def transform_data(df, binning_artifacts):
 
     return df
 
-# --- Step 3: Graph Building and Recommendation Logic (remains mostly the same) ---
-def build_heterogeneous_graph(df, lessee_lessor_weights, province_binner, province_pivot):
+# --- Step 3: Core Algorithm Logic ---
+
+def calculate_advanced_scores(df, lambda_decay, attribute_weights):
+    """
+    Calculates the advanced, weighted composite score for each transaction.
+    """
+    df = df.copy()
+    if df.empty or '披露日期' not in df.columns or df['披露日期'].isnull().all():
+        return df.assign(final_score=pd.Series(dtype='float64'))
+
+    # --- Calculate context-dependent average terms ---
+    # For a given attribute, the avg_term is based on that attribute AND the value bin
+    df['avg_term_province'] = df.groupby(['省份', '价值分箱'])['期限（年）'].transform('mean')
+    df['avg_term_industry'] = df.groupby(['申万行业一级', '价值分箱'])['期限（年）'].transform('mean')
+    df['avg_term_term'] = df.groupby(['期限分箱', '价值分箱'])['期限（年）'].transform('mean')
+    # For the value attribute itself, the context is just the value bin
+    df['avg_term_value'] = df.groupby('价值分箱')['期限（年）'].transform('mean')
+
+    # Fill any NaNs that might result from rare combinations
+    for col in ['avg_term_province', 'avg_term_industry', 'avg_term_term', 'avg_term_value']:
+        df[col].fillna(df['期限（年）'].mean(), inplace=True)
+
+    # --- Calculate time decay component ---
+    t_max = df['披露日期'].max()
+    today = t_max + pd.offsets.MonthEnd(0)
+    days_ago = (today - df['披露日期']).dt.days
+
+    # --- Calculate context-dependent composite scores ---
+    base_value = df['财产价值（万元）']
+    df['score_province'] = base_value * np.exp(df['avg_term_province'] - lambda_decay * days_ago)
+    df['score_industry'] = base_value * np.exp(df['avg_term_industry'] - lambda_decay * days_ago)
+    df['score_value'] = base_value * np.exp(df['avg_term_value'] - lambda_decay * days_ago)
+    df['score_term'] = base_value * np.exp(df['avg_term_term'] - lambda_decay * days_ago)
+
+    # --- Calculate final weighted score ---
+    w = attribute_weights
+    df['final_score'] = (w['province'] * df['score_province'] +
+                         w['industry'] * df['score_industry'] +
+                         w['value'] * df['score_value'] +
+                         w['term'] * df['score_term'])
+
+    return df
+
+
+def build_heterogeneous_graph(df, province_binner, province_pivot):
     """
     Builds the final heterogeneous graph.
-    Accepts pre-computed lessee-lessor weights for optimization efficiency.
+    Assumes that the input DataFrame `df` already contains the 'final_score' column.
     """
     G = nx.DiGraph()
 
-    # Province Similarity
+    # Province Similarity (unchanged)
     province_pivot_local = province_pivot.copy()
     province_profiles = normalize(province_pivot_local, norm='l1', axis=1)
     clusters = province_binner.predict(province_profiles)
     province_pivot_local['cluster'] = clusters
     similarity_matrix = cosine_similarity(province_profiles)
     similarity_df = pd.DataFrame(similarity_matrix, index=province_pivot_local.index, columns=province_pivot_local.index)
-
-    # Pre-calculation for Attribute -> Lessee edges
-    prov_totals = df.groupby('省份').size()
-    ind_totals = df.groupby('申万行业一级').size()
-    val_totals = df.groupby('价值分箱').size()
-    term_totals = df.groupby('期限分箱').size()
-    prov_lessee_counts = df.groupby(['省份', '承租人']).size().reset_index(name='count')
-    ind_lessee_counts = df.groupby(['申万行业一级', '承租人']).size().reset_index(name='count')
-    val_lessee_counts = df.groupby(['价值分箱', '承租人']).size().reset_index(name='count')
-    term_lessee_counts = df.groupby(['期限分箱', '承租人']).size().reset_index(name='count')
 
     # Add Nodes
     node_types = {
@@ -125,37 +158,37 @@ def build_heterogeneous_graph(df, lessee_lessor_weights, province_binner, provin
         'lessee': set(df['承租人']), 'lessor': set(df['出租人'])
     }
     for n_type, nodes in node_types.items():
-        for node in nodes: G.add_node(node, node_type=n_type)
+        for node in nodes:
+            if pd.notna(node): G.add_node(node, node_type=n_type)
+
+    # --- Edge Calculation based on final_score ---
 
     # Add Attribute -> Lessee Edges
-    edge_builders = [
-        (prov_lessee_counts, '省份', '承租人', prov_totals),
-        (ind_lessee_counts, '申万行业一级', '承租人', ind_totals),
-        (val_lessee_counts, '价值分箱', '承租人', val_totals),
-        (term_lessee_counts, '期限分箱', '承租人', term_totals),
-    ]
-    for counts_df, source_col, target_col, totals_map in edge_builders:
-        for _, row in counts_df.iterrows():
-            weight = row['count'] / totals_map.get(row[source_col], 1)
-            G.add_edge(row[source_col], row[target_col], weight=weight)
+    attribute_cols = ['省份', '申万行业一级', '价值分箱', '期限分箱']
+    for attr_col in attribute_cols:
+        attr_totals = df.groupby(attr_col)['final_score'].sum()
+        attr_lessee_sums = df.groupby([attr_col, '承租人'])['final_score'].sum().reset_index()
 
-    # Add Lessee -> Lessor Edges
-    if lessee_lessor_weights is None: # Default behavior for recommender.py
-        t_max = df['披露日期'].max()
-        lambda_decay = 0.005
-        df['time_decayed_value'] = df['财产价值（万元）'] * np.exp(-lambda_decay * (t_max - df['披露日期']).dt.days)
-        global_total_weighted_value = df['time_decayed_value'].sum()
-        if global_total_weighted_value > 0:
-            lessee_lessor_weights = df.groupby(['承租人', '出租人'])['time_decayed_value'].sum().reset_index()
-            lessee_lessor_weights['weight'] = lessee_lessor_weights['time_decayed_value'] / global_total_weighted_value
-        else:
-            lessee_lessor_weights = pd.DataFrame(columns=['承租人', '出租人', 'weight'])
+        for _, row in attr_lessee_sums.iterrows():
+            attr_node, lessee_node, score_sum = row[attr_col], row['承租人'], row['final_score']
+            total_score = attr_totals.get(attr_node, 1)
+            if total_score > 0:
+                weight = score_sum / total_score
+                if weight > 0 and pd.notna(attr_node) and pd.notna(lessee_node):
+                    G.add_edge(attr_node, lessee_node, weight=weight)
+
+    # Add Lessee -> Lessor Edges (Normalized per Lessee)
+    lessee_totals = df.groupby('承租人')['final_score'].sum()
+    lessee_lessor_sums = df.groupby(['承租人', '出租人'])['final_score'].sum()
+
+    lessee_lessor_weights = (lessee_lessor_sums / lessee_totals).reset_index(name='weight')
 
     for _, row in lessee_lessor_weights.iterrows():
-        if row['weight'] > 0:
-            G.add_edge(row['承租人'], row['出租人'], weight=row['weight'])
+        lessee, lessor, weight = row['承租人'], row['出租人'], row['weight']
+        if weight > 0 and pd.notna(lessee) and pd.notna(lessor):
+            G.add_edge(lessee, lessor, weight=weight)
 
-    # Add Province -> Province Edges
+    # Add Province -> Province Edges (unchanged)
     n_province_clusters = province_binner.n_clusters
     similarity_df_normalized = similarity_df.div(similarity_df.sum(axis=1), axis=0).fillna(0)
     for i in range(n_province_clusters):
@@ -168,16 +201,30 @@ def build_heterogeneous_graph(df, lessee_lessor_weights, province_binner, provin
 
     return G
 
-def get_recommendations(G, query, top_n=10):
+def get_recommendations(G, query, attribute_weights, top_n=10):
     """
     Runs Personalized PageRank and scales the scores.
+    The personalization vector is now weighted by the optimized attribute weights.
     """
+    # Create the personalization vector based on the query and optimized weights
     personalization = {
-        query['province']: 0.25,
-        query['industry']: 0.25,
-        query['value_bin']: 0.25,
-        query['term_bin']: 0.25,
+        query['province']: attribute_weights.get('province', 0.25),
+        query['industry']: attribute_weights.get('industry', 0.25),
+        query['value_bin']: attribute_weights.get('value', 0.25),
+        query['term_bin']: attribute_weights.get('term', 0.25),
     }
+
+    # Filter out any query nodes that might not be in the graph
+    personalization = {k: v for k, v in personalization.items() if G.has_node(k)}
+
+    # Normalize the personalization vector to ensure its values sum to 1
+    total_weight = sum(personalization.values())
+    if total_weight > 0:
+        personalization = {k: v / total_weight for k, v in personalization.items()}
+    else:
+        # If no query nodes are in the graph, we cannot proceed.
+        print("Warning: None of the query nodes are in the graph. Returning empty list.")
+        return []
 
     pagerank_scores = nx.pagerank(G, alpha=0.85, personalization=personalization, weight='weight')
 

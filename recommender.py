@@ -2,7 +2,7 @@ import configparser
 import pandas as pd
 import numpy as np
 import pickle
-from utils import load_data, transform_data, build_heterogeneous_graph, get_recommendations
+from utils import load_data, transform_data, calculate_advanced_scores, build_heterogeneous_graph, get_recommendations
 
 class Recommender:
     """
@@ -20,12 +20,17 @@ class Recommender:
         binning_rules_file = config['Paths']['binning_rules_file']
 
         # Load optimized parameters
-        best_lambda = config.getfloat('Optimized_Parameters', 'best_lambda')
-        best_w_freq = config.getfloat('Optimized_Parameters', 'best_w_freq')
-        best_w_val = config.getfloat('Optimized_Parameters', 'best_w_val')
+        self.best_lambda = config.getfloat('Optimized_Parameters', 'best_lambda')
+        self.attribute_weights = {
+            'province': config.getfloat('Optimized_Parameters', 'best_w_province'),
+            'industry': config.getfloat('Optimized_Parameters', 'best_w_industry'),
+            'value': config.getfloat('Optimized_Parameters', 'best_w_value'),
+            'term': config.getfloat('Optimized_Parameters', 'best_w_term'),
+        }
 
         print(f"  - Data file: {data_file}")
-        print(f"  - Using lambda: {best_lambda:.4f}, w_freq: {best_w_freq:.2f}, w_val: {best_w_val:.2f}")
+        print(f"  - Using lambda: {self.best_lambda:.4f}")
+        print(f"  - Using attribute weights: {self.attribute_weights}")
 
         # 2. Load production data and binning rules
         df_raw = load_data(data_file)
@@ -41,24 +46,14 @@ class Recommender:
         if self.df is None:
             raise RuntimeError("Failed to transform data.")
 
-        # 4. Calculate final edge weights using optimized params
-        df_copy = self.df.copy()
-        lessee_total_counts = df_copy.groupby('承租人')['承租人'].transform('size')
-        pair_counts = df_copy.groupby(['承租人', '出租人'])['承租人'].transform('size')
-        df_copy['freq_prop'] = pair_counts / lessee_total_counts
-        lessee_total_value = df_copy.groupby('承租人')['财产价值（万元）'].transform('sum')
-        pair_values = df_copy.groupby(['承租人', '出租人'])['财产价值（万元）'].transform('sum')
-        df_copy['val_prop'] = (pair_values / lessee_total_value).fillna(0)
-        t_max = df_copy['披露日期'].max()
-        time_decay = np.exp(-best_lambda * (t_max - df_copy['披露日期']).dt.days)
-        df_copy['composite_score'] = (df_copy['freq_prop'] * best_w_freq + df_copy['val_prop'] * best_w_val) * time_decay
-        lessee_lessor_weights = df_copy.groupby(['承租人', '出租人'])['composite_score'].sum().reset_index(name='weight')
+        # 4. Calculate final scores using optimized params
+        print("Calculating advanced scores for the graph...")
+        df_scored = calculate_advanced_scores(self.df, self.best_lambda, self.attribute_weights)
 
         # 5. Build and store the graph
         print("\nBuilding final graph on full dataset...")
         self.graph = build_heterogeneous_graph(
-            self.df,
-            lessee_lessor_weights=lessee_lessor_weights,
+            df_scored,
             province_binner=self.binning_artifacts['province_binner'],
             province_pivot=self.binning_artifacts['province_pivot']
         )
@@ -90,7 +85,7 @@ class Recommender:
         }
 
         print(f"\n--- Running Recommendation for: {pagerank_query} ---")
-        recommendations = get_recommendations(self.graph, pagerank_query)
+        recommendations = get_recommendations(self.graph, pagerank_query, self.attribute_weights)
         return recommendations
 
     def get_all_industries(self):
