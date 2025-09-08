@@ -141,7 +141,7 @@ def run_optimizer():
     # 1. Load and prepare data
     print("--- Preparing Data for Optimization ---")
     df = load_data(learning_data_file)
-    df['year_month'] = df['披露日期'].dt.to_period('M')
+    df['year_month'] = df['transaction_date'].dt.to_period('M')
     train_df_raw = df[df['year_month'].isin(train_periods)]
     test_df_raw = df[df['year_month'].isin(test_periods)]
 

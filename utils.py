@@ -9,13 +9,18 @@ from itertools import combinations
 
 # --- Step 1: Data Loading and Basic Cleaning ---
 def load_data(filepath):
+    """
+    Loads and cleans data, now using '起始日期' as the primary date column.
+    Drops rows where '起始日期' is missing.
+    """
     print("  - Loading and cleaning data...")
     try:
         df = pd.read_csv(filepath, encoding='utf-8-sig')
     except Exception as e:
         raise ValueError(f"Error loading file: {e}")
 
-    required_columns = ['承租人', '出租人', '承租人所属地区', '申万行业一级', '财产价值（万元）', '期限', '披露日期']
+    # Define required columns, now including '起始日期'
+    required_columns = ['承租人', '出租人', '承租人所属地区', '申万行业一级', '财产价值（万元）', '期限', '起始日期']
     df.dropna(subset=required_columns, inplace=True)
     df.columns = df.columns.str.strip()
 
@@ -33,8 +38,11 @@ def load_data(filepath):
         return val / 12 if '月' in term_str else val
 
     df['期限（年）'] = df['期限'].apply(parse_term)
-    df['披露日期'] = pd.to_datetime(df['披露日期'], errors='coerce')
-    df.dropna(subset=['期限（年）', '披露日期'], inplace=True)
+
+    # Use '起始日期' as the primary date, parse it, and drop rows if it's invalid
+    df['transaction_date'] = pd.to_datetime(df['起始日期'], errors='coerce')
+    df.dropna(subset=['期限（年）', 'transaction_date'], inplace=True)
+
     df['省份'] = df['承租人所属地区'].apply(lambda x: x.split('-')[0])
     return df
 
@@ -99,7 +107,7 @@ def calculate_advanced_scores(df, lambda_decay, attribute_weights):
     Calculates the advanced, weighted composite score for each transaction.
     """
     df = df.copy()
-    if df.empty or '披露日期' not in df.columns or df['披露日期'].isnull().all():
+    if df.empty or 'transaction_date' not in df.columns or df['transaction_date'].isnull().all():
         return df.assign(final_score=pd.Series(dtype='float64'))
 
     # --- Calculate context-dependent average terms ---
@@ -115,9 +123,9 @@ def calculate_advanced_scores(df, lambda_decay, attribute_weights):
         df[col].fillna(df['期限（年）'].mean(), inplace=True)
 
     # --- Calculate time decay component ---
-    t_max = df['披露日期'].max()
+    t_max = df['transaction_date'].max()
     today = t_max + pd.offsets.MonthEnd(0)
-    days_ago = (today - df['披露日期']).dt.days
+    days_ago = (today - df['transaction_date']).dt.days
 
     # --- Calculate context-dependent composite scores ---
     base_value = df['财产价值（万元）']
