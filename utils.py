@@ -44,6 +44,10 @@ def load_data(filepath):
     df.dropna(subset=['期限（年）', 'transaction_date'], inplace=True)
 
     df['省份'] = df['承租人所属地区'].apply(lambda x: x.split('-')[0])
+    # Drop rows where the province is missing or empty
+    df.dropna(subset=['省份'], inplace=True)
+    df = df[df['省份'] != '']
+
     return df
 
 # --- Step 2: Feature Engineering (Fitting the Binners) ---
