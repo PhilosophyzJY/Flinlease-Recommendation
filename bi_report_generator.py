@@ -50,7 +50,7 @@ HTML_TEMPLATE = """
         }}
         .grid-container {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
             gap: 20px;
         }}
         .grid-container-full {{
@@ -64,6 +64,9 @@ HTML_TEMPLATE = """
             box-shadow: 0 4px 6px rgba(0,0,0,0.05);
             padding: 20px;
             transition: transform 0.2s, box-shadow 0.2s;
+            min-height: 450px; /* Ensure a minimum height for cards */
+            display: flex; /* Use flexbox for better internal alignment */
+            flex-direction: column;
         }}
         .card:hover {{
             transform: translateY(-5px);
@@ -76,6 +79,18 @@ HTML_TEMPLATE = """
             border-bottom: 2px solid #e9ecef;
             padding-bottom: 10px;
             margin-bottom: 15px;
+            flex-shrink: 0; /* Prevent title from shrinking */
+        }}
+        /* Make the plotly graph div expand to fill the card */
+        .plotly-graph-div {{
+            flex-grow: 1;
+        }}
+
+        /* Responsive adjustments for smaller screens */
+        @media (max-width: 900px) {{
+            .grid-container {{
+                grid-template-columns: 1fr; /* Stack to a single column */
+            }}
         }}
         h1.section-title {{
             font-size: 28px;
@@ -160,6 +175,29 @@ def generate_lessee_char_figures(df):
             figs[title] = fig
     return figs
 
+def generate_lessee_attribute_figures(df):
+    """Generates figures for lessee attributes."""
+    figs = {}
+
+    # Ensure the column exists and is of string type, filling NaNs
+    if '承租人企业类型' in df.columns:
+        df_attr = df.copy()
+        df_attr['承租人企业类型'] = df_attr['承租人企业类型'].astype(str).fillna('')
+
+        attributes = {
+            '民企 (Private Enterprise)': '民企',
+            '国企 (State-Owned Enterprise)': '国企',
+            '发债 (Bond-Issuing)': '发债'
+        }
+
+        for title, attr in attributes.items():
+            counts = df_attr['承租人企业类型'].str.contains(attr, na=False).value_counts()
+            counts.index = counts.index.map({True: f'Yes ({attr})', False: f'No (Not {attr})'})
+            fig = px.pie(values=counts.values, names=counts.index, hole=.4, color_discrete_sequence=TABLEAU_COLORS)
+            figs[title] = fig
+
+    return figs
+
 def generate_lessor_pref_figures(df, top_n=10):
     """Generates Sankey diagrams for lessor preferences."""
     figs = {}
@@ -196,6 +234,7 @@ def generate_bi_report(df, output_html_path):
         **generate_overview_figures(df),
         **generate_geo_figures(df),
         **generate_lessee_char_figures(df),
+        **generate_lessee_attribute_figures(df),
         **generate_lessor_pref_figures(df, top_n=10)
     }
 
@@ -204,6 +243,7 @@ def generate_bi_report(df, output_html_path):
         "概览 (Overview)": ["交易数量时序图 (Transaction Volume Over Time)", "财产价值分布图 (Property Value Distribution)"],
         "地域分布分析 (Geographical Distribution)": ["各省份业务总价值 (Total Business Value by Province)", "各省份业务总数量 (Total Transaction Count by Province)"],
         "承租人特征分析 (Lessee Characteristics)": list(generate_lessee_char_figures(df).keys()),
+        "承租人属性分析 (Lessee Attribute Analysis)": list(generate_lessee_attribute_figures(df).keys()),
         "出租人偏好分析 (Lessor Preferences)": list(generate_lessor_pref_figures(df).keys())
     }
 
@@ -218,6 +258,8 @@ def generate_bi_report(df, output_html_path):
                 # Pass the user-facing title to the layout update function
                 _update_fig_layout(fig, fig_title)
                 fig_html = fig.to_html(full_html=False, include_plotlyjs=False, config={'displayModeBar': False})
+                # Remove the default style to allow CSS to control the size
+                fig_html = fig_html.replace('style="height:100%; width:100%;"', '')
                 section_html += _create_chart_card(fig_title, fig_html)
 
         section_html += "</div>"
